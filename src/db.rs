@@ -73,6 +73,8 @@ CREATE TABLE IF NOT EXISTS commands (
 pub struct Db {
     conn: Mutex<Connection>,
     root: String,
+    /// Enforce the data model (see `Config::strict_model`).
+    strict: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -168,12 +170,13 @@ fn normalize(ty: &str, value: &str) -> Option<String> {
 }
 
 impl Db {
-    pub fn open(path: &Path, root: &str) -> Result<Self> {
+    pub fn open(path: &Path, root: &str, strict: bool) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn: Mutex::new(conn),
             root: root.to_string(),
+            strict,
         })
     }
 
@@ -308,41 +311,50 @@ impl Db {
         Ok(map)
     }
 
+    /// Reads parameters. In lenient mode a missing parameter is silently created with an empty
+    /// value and a partial path simply yields whatever lies below it.
     pub fn get_values(&self, path: &str) -> Result<Vec<Param>, Fault> {
         let conn = self.conn();
         if path.is_empty() || path.ends_with('.') {
-            if !path.is_empty() && !Self::name_map(&conn)?.contains_key(path) {
+            if self.strict && !path.is_empty() && !Self::name_map(&conn)?.contains_key(path) {
                 return Err(Fault::invalid_name(path));
             }
-            Ok(Self::all_params(&conn)?
+            return Ok(Self::all_params(&conn)?
                 .into_iter()
                 .filter(|p| p.name.starts_with(path))
-                .collect())
-        } else {
-            conn.query_row(
-                &format!("SELECT {PARAM_COLS} FROM parameters WHERE name = ?1"),
-                [path],
-                row_param,
-            )
-            .optional()
-            .map_err(Fault::internal)?
-            .map(|p| vec![p])
-            .ok_or_else(|| Fault::invalid_name(path))
+                .collect());
         }
+        if !self.strict {
+            conn.execute(
+                "INSERT OR IGNORE INTO parameters (name, value, type, writable) VALUES (?1, '', 'xsd:string', 1)",
+                [path],
+            )
+            .map_err(Fault::internal)?;
+        }
+        conn.query_row(
+            &format!("SELECT {PARAM_COLS} FROM parameters WHERE name = ?1"),
+            [path],
+            row_param,
+        )
+        .optional()
+        .map_err(Fault::internal)?
+        .map(|p| vec![p])
+        .ok_or_else(|| Fault::invalid_name(path))
     }
 
     pub fn names(&self, path: &str, next_level: bool) -> Result<Vec<(String, bool)>, Fault> {
         let map = Self::name_map(&self.conn())?;
         if !path.is_empty() && !path.ends_with('.') {
-            if next_level {
+            if self.strict && next_level {
                 return Err(Fault::new(9003, "NextLevel must be false for a parameter path"));
             }
-            return map
-                .get(path)
-                .map(|w| vec![(path.to_string(), *w)])
-                .ok_or_else(|| Fault::invalid_name(path));
+            return match map.get(path) {
+                Some(w) => Ok(vec![(path.to_string(), *w)]),
+                None if self.strict => Err(Fault::invalid_name(path)),
+                None => Ok(Vec::new()),
+            };
         }
-        if !path.is_empty() && !map.contains_key(path) {
+        if self.strict && !path.is_empty() && !map.contains_key(path) {
             return Err(Fault::invalid_name(path));
         }
         Ok(map
@@ -354,7 +366,10 @@ impl Db {
             .collect())
     }
 
-    /// Atomically applies SetParameterValues. Returns the applied (name, value) pairs.
+    /// Applies SetParameterValues atomically and returns the applied (name, value) pairs.
+    /// Strict: unknown names, read-only parameters and invalid values fail the whole call (9003
+    /// with per-parameter details). Lenient: unknown parameters are created (typed by the
+    /// ACS-provided xsi:type), read-only flags and types are not checked.
     pub fn set_values(
         &self,
         items: &[ParamSet],
@@ -363,9 +378,9 @@ impl Db {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(Fault::internal)?;
         let mut fault = Fault::new(9003, "Invalid arguments");
-        let mut applied = Vec::new();
+        let mut applied = Vec::new(); // (name, value, type)
         for it in items {
-            let p = tx
+            let existing = tx
                 .query_row(
                     &format!("SELECT {PARAM_COLS} FROM parameters WHERE name = ?1"),
                     [&it.name],
@@ -373,25 +388,44 @@ impl Db {
                 )
                 .optional()
                 .map_err(Fault::internal)?;
-            match p {
-                None => fault.details.push((it.name.clone(), 9005, "Invalid parameter name".into())),
-                Some(p) if !p.writable => fault.details.push((
-                    it.name.clone(),
-                    9008,
-                    "Attempt to set a non-writable parameter".into(),
-                )),
-                Some(p) => match normalize(&p.ty, &it.value) {
-                    Some(v) => applied.push((it.name.clone(), v)),
-                    None => fault.details.push((it.name.clone(), 9007, "Invalid parameter value".into())),
-                },
+            if self.strict {
+                match &existing {
+                    None => {
+                        fault.details.push((it.name.clone(), 9005, "Invalid parameter name".into()));
+                        continue;
+                    }
+                    Some(p) if !p.writable => {
+                        fault.details.push((
+                            it.name.clone(),
+                            9008,
+                            "Attempt to set a non-writable parameter".into(),
+                        ));
+                        continue;
+                    }
+                    Some(p) if normalize(&p.ty, &it.value).is_none() => {
+                        fault.details.push((it.name.clone(), 9007, "Invalid parameter value".into()));
+                        continue;
+                    }
+                    Some(_) => {}
+                }
             }
+            let ty = existing
+                .map(|p| p.ty)
+                .or_else(|| it.ty.clone())
+                .unwrap_or_else(|| "xsd:string".into());
+            let value = normalize(&ty, &it.value).unwrap_or_else(|| it.value.clone());
+            applied.push((it.name.clone(), value, ty));
         }
         if !fault.details.is_empty() {
             return Err(fault);
         }
-        for (n, v) in &applied {
-            tx.execute("UPDATE parameters SET value = ?1 WHERE name = ?2", params![v, n])
-                .map_err(Fault::internal)?;
+        for (name, value, ty) in &applied {
+            tx.execute(
+                "INSERT INTO parameters (name, value, type, writable) VALUES (?1, ?2, ?3, 1) \
+                 ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+                params![name, value, ty],
+            )
+            .map_err(Fault::internal)?;
         }
         tx.execute(
             "UPDATE parameters SET value = ?1 WHERE name = ?2",
@@ -399,19 +433,25 @@ impl Db {
         )
         .map_err(Fault::internal)?;
         tx.commit().map_err(Fault::internal)?;
-        Ok(applied)
+        Ok(applied.into_iter().map(|(n, v, _)| (n, v)).collect())
     }
 
     pub fn set_attrs(&self, items: &[AttrSet]) -> Result<(), Fault> {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(Fault::internal)?;
-        let params_all = Self::all_params(&tx)?;
-        let names = Self::name_map(&tx)?;
         for it in items {
-            if !names.contains_key(&it.name) {
-                return Err(Fault::invalid_name(&it.name));
+            if self.strict {
+                if !Self::name_map(&tx)?.contains_key(&it.name) {
+                    return Err(Fault::invalid_name(&it.name));
+                }
+            } else if !it.name.ends_with('.') {
+                tx.execute(
+                    "INSERT OR IGNORE INTO parameters (name, value, type, writable) VALUES (?1, '', 'xsd:string', 1)",
+                    [&it.name],
+                )
+                .map_err(Fault::internal)?;
             }
-            for p in params_all.iter().filter(|p| p.name.starts_with(&it.name)) {
+            for p in Self::all_params(&tx)?.iter().filter(|p| p.name.starts_with(&it.name)) {
                 if it.notification_change {
                     tx.execute(
                         "UPDATE parameters SET notification = ?1 WHERE name = ?2",
@@ -436,33 +476,40 @@ impl Db {
         self.get_values(path)
     }
 
+    /// Creates the next instance below `path`. Lenient mode accepts any path; strict mode
+    /// requires a multi-instance object path below the root.
     pub fn add_object(&self, path: &str, key: &str) -> Result<u32, Fault> {
-        let last_numeric = path
-            .trim_end_matches('.')
-            .rsplit('.')
-            .next()
-            .is_some_and(|s| s.parse::<u32>().is_ok());
-        let in_root = path.starts_with(&format!("{}.", self.root));
-        if !path.ends_with('.') || !in_root || last_numeric {
-            return Err(Fault::invalid_name(path));
+        let mut path = path.to_string();
+        if !self.strict && !path.ends_with('.') {
+            path.push('.');
         }
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(Fault::internal)?;
-        // Fixed (non multi-instance) objects own parameters and cannot be instantiated.
-        let fixed: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM parameters WHERE substr(name, 1, length(?1)) = ?1)",
-                [path],
-                |r| r.get(0),
-            )
-            .map_err(Fault::internal)?;
-        if fixed {
-            return Err(Fault::new(9005, format!("{path} is not a multi-instance object")));
+        if self.strict {
+            let last_numeric = path
+                .trim_end_matches('.')
+                .rsplit('.')
+                .next()
+                .is_some_and(|s| s.parse::<u32>().is_ok());
+            if !path.ends_with('.') || !path.starts_with(&format!("{}.", self.root)) || last_numeric {
+                return Err(Fault::invalid_name(&path));
+            }
+            // Fixed (non multi-instance) objects own parameters and cannot be instantiated.
+            let fixed: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM parameters WHERE substr(name, 1, length(?1)) = ?1)",
+                    [&path],
+                    |r| r.get(0),
+                )
+                .map_err(Fault::internal)?;
+            if fixed {
+                return Err(Fault::new(9005, format!("{path} is not a multi-instance object")));
+            }
         }
         let next: i64 = tx
             .query_row(
                 "SELECT next_instance FROM object_tables WHERE path = ?1",
-                [path],
+                [&path],
                 |r| r.get(0),
             )
             .optional()
@@ -475,7 +522,7 @@ impl Db {
         )
         .map_err(Fault::internal)?;
         tx.execute(
-            "INSERT INTO objects (path) VALUES (?1)",
+            "INSERT OR IGNORE INTO objects (path) VALUES (?1)",
             [format!("{path}{next}.")],
         )
         .map_err(Fault::internal)?;
@@ -488,29 +535,37 @@ impl Db {
         Ok(next as u32)
     }
 
+    /// Removes everything at and below `path`. Strict mode requires an existing instance;
+    /// lenient mode treats a missing object as already deleted.
     pub fn delete_object(&self, path: &str, key: &str) -> Result<(), Fault> {
+        let mut path = path.to_string();
+        if !self.strict && !path.ends_with('.') {
+            path.push('.');
+        }
+        if path == "." {
+            return Err(Fault::new(9003, "Invalid arguments: empty object name"));
+        }
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(Fault::internal)?;
-        let exists: bool = tx
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM objects WHERE path = ?1)",
-                [path],
-                |r| r.get(0),
-            )
-            .map_err(Fault::internal)?;
-        if !path.ends_with('.') || !exists {
-            return Err(Fault::invalid_name(path));
+        if self.strict {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM objects WHERE path = ?1)",
+                    [&path],
+                    |r| r.get(0),
+                )
+                .map_err(Fault::internal)?;
+            if !path.ends_with('.') || !exists {
+                return Err(Fault::invalid_name(&path));
+            }
         }
-        tx.execute(
+        for sql in [
             "DELETE FROM objects WHERE substr(path, 1, length(?1)) = ?1",
-            [path],
-        )
-        .map_err(Fault::internal)?;
-        tx.execute(
+            "DELETE FROM object_tables WHERE substr(path, 1, length(?1)) = ?1",
             "DELETE FROM parameters WHERE substr(name, 1, length(?1)) = ?1",
-            [path],
-        )
-        .map_err(Fault::internal)?;
+        ] {
+            tx.execute(sql, [&path]).map_err(Fault::internal)?;
+        }
         tx.execute(
             "UPDATE parameters SET value = ?1 WHERE name = ?2",
             params![key, self.param_key_name()],
@@ -672,14 +727,22 @@ mod tests {
     use clap::Parser;
 
     fn db() -> (Db, Config) {
+        make(false)
+    }
+
+    fn strict_db() -> Db {
+        make(true).0
+    }
+
+    fn make(strict: bool) -> (Db, Config) {
         let cfg = Config::parse_from(["x"]);
-        let db = Db::open(Path::new(":memory:"), "Device").unwrap();
+        let db = Db::open(Path::new(":memory:"), "Device", strict).unwrap();
         db.apply_seeds(&crate::model::seeds(&cfg, "http://1.2.3.4:7547/")).unwrap();
         (db, cfg)
     }
 
-    fn set(name: &str, value: &str) -> ParamSet {
-        ParamSet { name: name.into(), value: value.into() }
+    fn set(name: &str, value: &str, ty: Option<&str>) -> ParamSet {
+        ParamSet { name: name.into(), value: value.into(), ty: ty.map(Into::into) }
     }
 
     #[test]
@@ -692,43 +755,84 @@ mod tests {
         assert!(names.contains(&"Device.RootDataModelVersion"));
         assert!(!names.contains(&"Device.DeviceInfo.Manufacturer"));
         assert_eq!(db.names("", true).unwrap().len(), 1);
-        assert!(db.names("Device.Nope.", true).is_err());
+        assert!(db.names("Device.Nope.", true).unwrap().is_empty());
     }
 
     #[test]
-    fn set_is_atomic_and_typed() {
+    fn set_creates_and_ignores_model() {
         let (db, _) = db();
-        let bad = [
-            set("Device.DeviceInfo.ProvisioningCode", "abc"),
-            set("Device.DeviceInfo.Manufacturer", "x"),
-            set("Device.ManagementServer.PeriodicInformEnable", "maybe"),
-            set("Device.Missing", "1"),
+        let items = [
+            set("Device.DeviceInfo.Manufacturer", "x", None), // read-only in the seed
+            set("Device.New.Flag", "true", Some("xsd:boolean")), // unknown, typed
+            set("Device.New.Text", "hi", None),
+            set("Device.ManagementServer.PeriodicInformEnable", "maybe", None), // invalid bool
         ];
-        let f = db.set_values(&bad, "k").unwrap_err();
-        assert_eq!(f.details.len(), 3);
-        assert_eq!(db.value("Device.DeviceInfo.ProvisioningCode"), "");
-        let ok = [
-            set("Device.DeviceInfo.ProvisioningCode", "abc"),
-            set("Device.ManagementServer.PeriodicInformEnable", "true"),
-        ];
-        db.set_values(&ok, "key1").unwrap();
-        assert_eq!(db.value("Device.DeviceInfo.ProvisioningCode"), "abc");
-        assert_eq!(db.value("Device.ManagementServer.PeriodicInformEnable"), "1");
-        assert_eq!(db.value("Device.ManagementServer.ParameterKey"), "key1");
+        db.set_values(&items, "k1").unwrap();
+        assert_eq!(db.value("Device.DeviceInfo.Manufacturer"), "x");
+        let flag = db.param("Device.New.Flag").unwrap();
+        assert_eq!((flag.value.as_str(), flag.ty.as_str()), ("1", "xsd:boolean"));
+        assert_eq!(db.param("Device.New.Text").unwrap().ty, "xsd:string");
+        assert_eq!(db.value("Device.ManagementServer.PeriodicInformEnable"), "maybe");
+        assert_eq!(db.value("Device.ManagementServer.ParameterKey"), "k1");
+        // created parameters become browsable
+        assert!(db.names("Device.New.", true).unwrap().len() == 2);
+    }
+
+    #[test]
+    fn get_creates_empty() {
+        let (db, _) = db();
+        assert!(db.param("Device.Ghost.Value").is_none());
+        let v = db.get_values("Device.Ghost.Value").unwrap();
+        assert_eq!((v[0].name.as_str(), v[0].value.as_str(), v[0].ty.as_str()), ("Device.Ghost.Value", "", "xsd:string"));
+        assert!(db.param("Device.Ghost.Value").is_some());
+        assert!(db.get_values("Device.Nothing.").unwrap().is_empty());
     }
 
     #[test]
     fn object_lifecycle() {
         let (db, _) = db();
-        assert!(db.add_object("Device.DeviceInfo.", "k").is_err());
-        assert!(db.add_object("Device.Foo.1.", "k").is_err());
         assert_eq!(db.add_object("Device.Foo.", "k").unwrap(), 1);
-        assert_eq!(db.add_object("Device.Foo.", "k").unwrap(), 2);
-        let n = db.names("Device.Foo.", true).unwrap();
-        assert_eq!(n.len(), 2);
+        assert_eq!(db.add_object("Device.Foo", "k").unwrap(), 2);
+        assert_eq!(db.names("Device.Foo.", true).unwrap().len(), 2);
         db.delete_object("Device.Foo.1.", "k2").unwrap();
-        assert!(db.delete_object("Device.Foo.1.", "k2").is_err());
+        db.delete_object("Device.Foo.1.", "k2").unwrap(); // already gone: still fine
         assert_eq!(db.add_object("Device.Foo.", "k").unwrap(), 3);
         assert_eq!(db.value("Device.ManagementServer.ParameterKey"), "k");
+        assert!(db.delete_object("", "k").is_err());
+    }
+
+    #[test]
+    fn strict_mode_enforces_model() {
+        let db = strict_db();
+        let bad = [
+            set("Device.DeviceInfo.ProvisioningCode", "abc", None),
+            set("Device.DeviceInfo.Manufacturer", "x", None),
+            set("Device.ManagementServer.PeriodicInformEnable", "maybe", None),
+            set("Device.Missing", "1", None),
+        ];
+        let f = db.set_values(&bad, "k").unwrap_err();
+        assert_eq!(f.details.iter().map(|d| d.1).collect::<Vec<_>>(), [9008, 9007, 9005]);
+        assert_eq!(db.value("Device.DeviceInfo.ProvisioningCode"), "", "failed set must be atomic");
+        let ok = [
+            set("Device.DeviceInfo.ProvisioningCode", "abc", None),
+            set("Device.ManagementServer.PeriodicInformEnable", "true", None),
+        ];
+        db.set_values(&ok, "key1").unwrap();
+        assert_eq!(db.value("Device.ManagementServer.PeriodicInformEnable"), "1");
+        assert_eq!(db.value("Device.ManagementServer.ParameterKey"), "key1");
+
+        assert!(db.get_values("Device.Ghost.Value").is_err());
+        assert!(db.param("Device.Ghost.Value").is_none());
+        assert!(db.get_values("Device.Nothing.").is_err());
+        assert!(db.names("Device.Nope.", true).is_err());
+        assert!(db.names("Device.DeviceInfo.Manufacturer", true).is_err());
+
+        assert!(db.add_object("Device.DeviceInfo.", "k").is_err());
+        assert!(db.add_object("Device.Foo.1.", "k").is_err());
+        assert!(db.add_object("Elsewhere.Foo.", "k").is_err());
+        assert_eq!(db.add_object("Device.Foo.", "k").unwrap(), 1);
+        db.delete_object("Device.Foo.1.", "k2").unwrap();
+        assert!(db.delete_object("Device.Foo.1.", "k2").is_err());
+        assert_eq!(db.add_object("Device.Foo.", "k").unwrap(), 2);
     }
 }

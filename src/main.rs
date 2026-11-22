@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         .init();
     let cfg = Config::parse();
 
-    let db = Db::open(&cfg.db, &cfg.root)
+    let db = Db::open(&cfg.db, &cfg.root, cfg.strict_model)
         .with_context(|| format!("opening database {}", cfg.db.display()))?;
 
     // Seeds only fill gaps; explicit CLI values override what is stored.
@@ -97,6 +97,7 @@ async fn main() -> Result<()> {
     info!(
         serial = %ctx.cfg.serial_number,
         root = %ctx.cfg.root,
+        strict_model = ctx.cfg.strict_model,
         db = %ctx.cfg.db.display(),
         "stubtr069 starting (no local changes will be applied)"
     );

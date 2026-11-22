@@ -25,6 +25,7 @@ pub const SUPPORTED_METHODS: &[&str] = &[
 pub struct ParamSet {
     pub name: String,
     pub value: String,
+    pub ty: Option<String>,
 }
 
 #[derive(Debug)]
@@ -110,9 +111,13 @@ pub fn parse_rpc(n: &Node) -> Rpc {
                 .map(|l| {
                     l.children_named("ParameterValueStruct")
                         .map(|s| {
+                            let v = s.child("Value");
                             ParamSet {
                                 name: s.child_text("Name").to_string(),
-                                value: s.child("Value").map(|v| v.text.clone()).unwrap_or_default(),
+                                value: v.map(|v| v.text.clone()).unwrap_or_default(),
+                                ty: v
+                                    .and_then(|v| v.attrs.iter().find(|(k, _)| k == "type"))
+                                    .map(|(_, t)| t.clone()),
                             }
                         })
                         .collect()
@@ -350,6 +355,7 @@ mod tests {
                 assert_eq!(parameter_key, "pk");
                 assert_eq!(values[0].name, "A.B");
                 assert_eq!(values[0].value, "1");
+                assert_eq!(values[0].ty.as_deref(), Some("xsd:boolean"));
             }
             r => panic!("{r:?}"),
         }
@@ -361,6 +367,7 @@ mod tests {
             values: vec![ParamSet {
                 name: "X.Password".into(),
                 value: "hunter2".into(),
+                ty: None,
             }],
             parameter_key: String::new(),
         };

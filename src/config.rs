@@ -48,6 +48,12 @@ pub struct Config {
     #[arg(long, default_value = "Device", value_parser = ["Device", "InternetGatewayDevice"])]
     pub root: String,
 
+    /// Enforce the data model: reject unknown parameters, writes to read-only parameters,
+    /// invalid values and operations on missing objects. By default the model is lenient:
+    /// unknown parameters are created on write and read back as empty.
+    #[arg(long, env = "STUB_STRICT_MODEL")]
+    pub strict_model: bool,
+
     #[arg(long, default_value = "StubVendor")]
     pub manufacturer: String,
 

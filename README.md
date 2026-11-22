@@ -27,7 +27,7 @@ cargo run --release -- --acs-url http://acs.example:9090/ \
 
 Key options (all also available as `STUB_*` env vars, see `--help`): `--db`, `--download-dir`,
 `--conn-req-listen` (default `0.0.0.0:7547`), `--conn-req-url` (advertised; auto-detected
-otherwise), `--conn-req-username/--conn-req-password`, `--root Device|InternetGatewayDevice`.
+otherwise), `--conn-req-username/--conn-req-password`, `--root Device|InternetGatewayDevice`, `--strict-model` (`STUB_STRICT_MODEL`).
 Log level via `RUST_LOG` (`RUST_LOG=acs_command=debug` also prints the raw SOAP of each command).
 
 ## Behavior
@@ -36,7 +36,7 @@ Log level via `RUST_LOG` (`RUST_LOG=acs_command=debug` also prints the raw SOAP 
 | --- | --- |
 | Sessions | Started on boot, by Connection Request, after a finished Download, after Reboot/FactoryReset, and by ScheduleInform. Failed sessions retry with exponential backoff. |
 | Auth | HTTP Basic and Digest (MD5/SHA-256) towards the ACS and for incoming Connection Requests. |
-| Data model | `Get/SetParameterValues`, `GetParameterNames`, `Get/SetParameterAttributes`, `AddObject`, `DeleteObject` operate on SQLite (`parameters`, `objects`, `object_tables`). Sets are atomic and type-checked; `ParameterKey` is tracked. Passwords always read back empty. |
+| Data model | `Get/SetParameterValues`, `GetParameterNames`, `Get/SetParameterAttributes`, `AddObject`, `DeleteObject` operate on SQLite (`parameters`, `objects`, `object_tables`). By default the model is **not enforced** (enable validation with `--strict-model`, which rejects unknown parameters with 9005, read-only writes with 9008, bad values with 9007 and invalid object operations): setting an unknown parameter creates it (typed by the ACS-sent `xsi:type`, default `xsd:string`), reading an unknown parameter creates it with an empty value and returns it, and read-only flags, value types and object existence are never rejected. Known booleans/ints are still normalized when the value parses. `ParameterKey` is tracked; passwords always read back empty. |
 | Download | Fetched over http into `--download-dir`, size checked, SHA-256 recorded in table `downloads`, then reported via `TransferComplete` (`7 TRANSFER COMPLETE` + `M Download`). Never applied. |
 | Reboot / FactoryReset | Simulated: only the events and (for FactoryReset) the default data model are restored. |
 | Command log | Every ACS RPC is logged (target `acs_command`, secrets redacted) and stored with its raw XML in table `commands`. |

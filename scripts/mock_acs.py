@@ -44,9 +44,10 @@ def rpc_queue(base):
          + sv("Device.ManagementServer.Password", PASS)
          + sv("Device.ManagementServer.PeriodicInformEnable", "1", "xsd:boolean")
          + "</ParameterList><ParameterKey>key-1</ParameterKey></cwmp:SetParameterValues>"),
-        ("SetParameterValues(bad)", '<cwmp:SetParameterValues><ParameterList soapenc:arrayType="cwmp:ParameterValueStruct[2]">'
-         + sv("Device.DeviceInfo.Manufacturer", "x") + sv("Device.Nope", "1")
+        ("SetParameterValues(lenient)", '<cwmp:SetParameterValues><ParameterList soapenc:arrayType="cwmp:ParameterValueStruct[2]">'
+         + sv("Device.DeviceInfo.Manufacturer", "x") + sv("Device.Nope.Flag", "true", "xsd:boolean")
          + "</ParameterList><ParameterKey>key-2</ParameterKey></cwmp:SetParameterValues>"),
+        ("GetParameterValues(unknown)", '<cwmp:GetParameterValues><ParameterNames soapenc:arrayType="xsd:string[1]"><string>Device.Ghost.Value</string></ParameterNames></cwmp:GetParameterValues>'),
         ("GetParameterNames", "<cwmp:GetParameterNames><ParameterPath>Device.</ParameterPath><NextLevel>1</NextLevel></cwmp:GetParameterNames>"),
         ("AddObject", "<cwmp:AddObject><ObjectName>Device.Hosts.Host.</ObjectName><ParameterKey>key-3</ParameterKey></cwmp:AddObject>"),
         ("GetParameterNames(all)", "<cwmp:GetParameterNames><ParameterPath>Device.Hosts.</ParameterPath><NextLevel>0</NextLevel></cwmp:GetParameterNames>"),
