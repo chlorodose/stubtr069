@@ -1,0 +1,18 @@
+[package]
+name = "stubtr069"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+clap = { version = "4.6.9", features = ["derive", "env"] }
+futures-util = "0.3.34"
+hex = "0.4.3"
+md-5 = "0.11.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["cookies", "stream"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util", "fs"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
