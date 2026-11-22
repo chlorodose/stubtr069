@@ -36,6 +36,17 @@ pub struct Config {
     #[arg(long, env = "STUB_CONN_REQ_URL")]
     pub conn_req_url: Option<String>,
 
+    /// Executable printing the ConnectionRequestURL (first non-empty stdout line), for hosts whose
+    /// address changes (e.g. DHCP). Run at startup, before every session and every
+    /// `--conn-req-url-interval` seconds; a changed URL is reported with a `4 VALUE CHANGE`
+    /// Inform. Receives STUB_ACS_URL, STUB_CONN_REQ_LISTEN and STUB_CONN_REQ_PORT.
+    #[arg(long, env = "STUB_CONN_REQ_URL_SCRIPT", conflicts_with = "conn_req_url")]
+    pub conn_req_url_script: Option<PathBuf>,
+
+    /// Seconds between runs of the script (0 = only at startup and before sessions).
+    #[arg(long, env = "STUB_CONN_REQ_URL_INTERVAL", default_value_t = 30)]
+    pub conn_req_url_interval: u64,
+
     /// Connection Request username expected from the ACS.
     #[arg(long, env = "STUB_CONN_REQ_USERNAME", default_value = "stub")]
     pub conn_req_username: String,

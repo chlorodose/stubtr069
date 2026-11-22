@@ -1,5 +1,6 @@
 mod config;
 mod connreq;
+mod connurl;
 mod ctx;
 mod db;
 mod digest;
@@ -13,12 +14,10 @@ mod soap;
 mod util;
 mod xml;
 
-use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use tokio::net::{UdpSocket, lookup_host};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -26,22 +25,6 @@ use tracing_subscriber::EnvFilter;
 use config::Config;
 use ctx::Ctx;
 use db::Db;
-
-/// Determines the local address the ACS would see, by "connecting" a UDP socket to it.
-async fn detect_local_ip(acs_url: &str) -> IpAddr {
-    let probe = async {
-        let url = reqwest::Url::parse(acs_url).ok()?;
-        let addr = lookup_host((url.host_str()?, url.port_or_known_default()?))
-            .await
-            .ok()?
-            .next()?;
-        let bind = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
-        let sock = UdpSocket::bind(bind).await.ok()?;
-        sock.connect(addr).await.ok()?;
-        Some(sock.local_addr().ok()?.ip())
-    };
-    probe.await.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
-}
 
 fn backoff(retry: u32) -> Duration {
     Duration::from_secs((5u64 << retry.min(6)).min(300))
@@ -62,13 +45,16 @@ async fn main() -> Result<()> {
         .acs_url
         .clone()
         .unwrap_or_else(|| db.value(&format!("{}.ManagementServer.URL", cfg.root)));
-    let conn_req_url = match &cfg.conn_req_url {
-        Some(u) => u.clone(),
-        None => {
-            let ip = detect_local_ip(&known_url).await;
-            let host = if ip.is_ipv6() { format!("[{ip}]") } else { ip.to_string() };
-            format!("http://{host}:{}/", cfg.conn_req_listen.port())
-        }
+    let conn_req_url = match (&cfg.conn_req_url, &cfg.conn_req_url_script) {
+        (Some(u), _) => u.clone(),
+        (None, Some(script)) => match connurl::run_script(script, &cfg, &known_url).await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("ConnectionRequestURL script failed ({e:#}); using the auto-detected address for now");
+                connurl::auto_url(&cfg, &known_url).await
+            }
+        },
+        (None, None) => connurl::auto_url(&cfg, &known_url).await,
     };
     db.apply_seeds(&model::seeds(&cfg, &conn_req_url))?;
     let root = &cfg.root;
@@ -111,6 +97,9 @@ async fn main() -> Result<()> {
             }
         }
     });
+    if ctx.cfg.conn_req_url_script.is_some() && ctx.cfg.conn_req_url_interval > 0 {
+        tokio::spawn(connurl::watch(ctx.clone()));
+    }
     download::resume(&ctx);
     ctx.fire(); // startup session
 

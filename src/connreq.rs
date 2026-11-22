@@ -14,7 +14,7 @@ use crate::util::base64_decode;
 
 pub async fn serve(ctx: Arc<Ctx>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(ctx.cfg.conn_req_listen).await?;
-    info!(listen = %ctx.cfg.conn_req_listen, url = %ctx.conn_req_url, "connection request server up");
+    info!(listen = %ctx.cfg.conn_req_listen, url = %ctx.conn_req_url(), "connection request server up");
     let app = Router::new().fallback(handle).with_state(ctx);
     axum::serve(listener, app).await?;
     Ok(())

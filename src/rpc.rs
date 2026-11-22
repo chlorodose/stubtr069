@@ -116,7 +116,7 @@ pub fn execute(ctx: &Arc<Ctx>, rpc: Rpc) -> Result<String, Fault> {
             Ok("<cwmp:RebootResponse/>".into())
         }
         Rpc::FactoryReset => {
-            db.factory_reset(&model::seeds(&ctx.cfg, &ctx.conn_req_url))
+            db.factory_reset(&model::seeds(&ctx.cfg, &ctx.conn_req_url()))
                 .map_err(Fault::internal)?;
             db.add_event("0 BOOTSTRAP", "").map_err(Fault::internal)?;
             info!("simulated factory reset: data model restored to defaults");

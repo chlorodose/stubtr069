@@ -136,7 +136,8 @@ class H(BaseHTTPRequestHandler):
             sid = secrets.token_hex(8)
             hdrs = [("Set-Cookie", f"sid={sid}; Path=/")]
             events = [l.split("<")[0] for l in body.split("<EventCode>")[1:]]
-            print(f"[ACS] Inform #{STATE['informs']} events={events}", flush=True)
+            url = body.split("ConnectionRequestURL</Name><Value", 1)[-1].split(">")[1].split("<")[0] if "ConnectionRequestURL" in body else ""
+            print(f"[ACS] Inform #{STATE['informs']} events={events} connreq_url={url}", flush=True)
             STATE["informs"] += 1
             base = f"http://127.0.0.1:{self.server.server_port}"
             q = rpc_queue(base) if STATE["informs"] == 1 else []

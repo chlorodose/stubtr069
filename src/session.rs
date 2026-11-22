@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use reqwest::Method;
 use tracing::{info, warn};
 
+use crate::connurl;
 use crate::ctx::{Ctx, unsupported};
 use crate::db::Download;
 use crate::fault::Fault;
@@ -27,6 +28,15 @@ enum Awaiting {
 }
 
 pub async fn run(ctx: &Arc<Ctx>, retry_count: u32) -> Result<()> {
+    if let Err(e) = connurl::refresh(ctx).await {
+        warn!("cannot refresh ConnectionRequestURL, keeping the previous one: {e:#}");
+    }
+    let events = ctx.db.pending_events()?;
+    if events.is_empty() {
+        // A trigger can outlive its events when another session already reported them.
+        tracing::debug!("no pending events, skipping session");
+        return Ok(());
+    }
     let session = ctx.db.next_session_id()?;
     let root = ctx.db.root().to_string();
     let url = ctx.db.value(&format!("{root}.ManagementServer.URL"));
@@ -43,7 +53,6 @@ pub async fn run(ctx: &Arc<Ctx>, retry_count: u32) -> Result<()> {
         true,
     )?;
 
-    let events = ctx.db.pending_events()?;
     let max_event = events.iter().map(|e| e.id).max().unwrap_or(0);
     let event_list: Vec<(String, String)> = events
         .iter()
