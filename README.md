@@ -55,8 +55,8 @@ It runs at startup, before every session and every `--conn-req-url-interval` sec
 `ManagementServer.ConnectionRequestURL` parameter is updated and a session with the
 `4 VALUE CHANGE` event is opened right away, so the ACS learns the new address. If the script fails
 or prints something invalid, the previous URL is kept and a warning is logged. Without a script the
-address is auto-detected once at startup. In the container, mount the script and make sure the tools
-it uses exist in the image (it ships no `iproute2`).
+address is auto-detected once at startup. In the container, mount the script (the image ships `iproute2` and `jq` for
+it, plus the Debian base tools).
 
 ```sh
 #!/bin/sh
